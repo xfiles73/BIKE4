@@ -779,6 +779,10 @@ class ProxyDevice extends BluetoothDevice {
         _fbd = fbd;
         _currentFbd = fbd;
         await ftmsEmulator.attachDefinition(_fbd!);
+        // Turn on the trainer's telemetry tap: FTMS/CPS notifications only
+        // start flowing once their CCCDs are enabled. This device relays the
+        // values into the definition (processCharacteristic -> onNotification).
+        unawaited(fbd.ensureTrainerSubscriptions());
         if (_attachesZwiftController) {
           await ftmsEmulator.attachDefinition(_zwiftControllerEmulator!);
         }
@@ -1318,6 +1322,7 @@ class ProxyDevice extends BluetoothDevice {
         );
         _currentFbd = _fbd;
         _seedFitnessBikeDefinition(_fbd!);
+        unawaited(_fbd!.ensureTrainerSubscriptions());
       }
 
       _retrofitModeN.value = next;
