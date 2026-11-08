@@ -131,8 +131,8 @@ void main() {
     final cpData = ByteData.sublistView(cp);
     expect(cpData.getUint16(0, Endian.little), 0x0020); // crank revolution data
     expect(cpData.getInt16(2, Endian.little), 250); // power is mandatory
-    expect(cpData.getUint16(4, Endian.little), 0); // cumulative crank revs
-    expect(cpData.getUint16(6, Endian.little), closeTo(1024, 1)); // 1 s in 1/1024 s
+    expect(cpData.getUint16(4, Endian.little), 1); // 90 rpm * 1 s = 1.5 revs -> 1 whole
+    expect(cpData.getUint16(6, Endian.little), closeTo(683, 1)); // one rev at 90 rpm (1/1024 s)
   });
 }
 
