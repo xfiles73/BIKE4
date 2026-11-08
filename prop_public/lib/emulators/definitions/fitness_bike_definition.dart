@@ -1090,15 +1090,18 @@ class FitnessBikeDefinition extends BleDefinition {
 
     // CYCLING_POWER_MEASUREMENT (0x2A63): flags + mandatory Instantaneous
     // Power, then Crank Revolution Data (0x0020): cumulative revolutions
-    // (uint16) and last crank event time (uint16, 1/1024 s).
-    final crankDelta = cadenceRpm / 60.0 * dt;
-    _clientCrankRevsFrac += crankDelta;
+    // (uint16) and last crank event time (uint16, 1/1024 s). The event time
+    // advances per completed revolution (61440/1024 = 60 s worth of ticks per
+    // minute at the current cadence), like a real power meter.
+    _clientCrankRevsFrac += cadenceRpm / 60.0 * dt;
     final wholeRevs = _clientCrankRevsFrac.floor();
     if (wholeRevs > 0) {
       _clientCrankRevs = (_clientCrankRevs + wholeRevs) & 0xFFFF;
+      if (cadenceRpm > 0) {
+        _clientCrankEvt = (_clientCrankEvt + (wholeRevs * 61440 / cadenceRpm).round()) & 0xFFFF;
+      }
       _clientCrankRevsFrac -= wholeRevs;
     }
-    _clientCrankEvt = (_clientCrankEvt + (dt * 1024).round()) & 0xFFFF;
 
     final cp = ByteData(8)
       ..setUint16(0, 0x0020, Endian.little)
