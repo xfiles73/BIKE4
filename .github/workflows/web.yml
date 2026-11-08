@@ -1,0 +1,15 @@
+name: "Build Web"
+
+# Disattivato: il progetto usa dart:ffi (win32/bluetooth) e non e' compilabile
+# per Web. Questo workflow, scattando a ogni push su main, falliva con
+# "Target dart2js failed: dart:ffi is not available on this platform" e
+# bloccava la Release Windows creata da build.yml.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  disabled:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Web build disabilitata (dart:ffi non supportato su web)"

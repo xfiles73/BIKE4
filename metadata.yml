@@ -1,0 +1,13 @@
+name: "Store Metadata (disabilitato)"
+
+# Workflow disabilitato: richiede il submodule privato `prop` e i segreti degli
+# store (fastlane), non necessari per la build Windows gratuita.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  disabled:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "disabled"

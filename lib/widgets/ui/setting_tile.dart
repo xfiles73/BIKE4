@@ -1,0 +1,92 @@
+import 'package:bike_control/widgets/ui/colors.dart';
+import 'package:bike_control/widgets/ui/type_scale.dart';
+import 'package:shadcn_flutter/shadcn_flutter.dart';
+
+class SettingTile extends StatelessWidget {
+  final IconData? icon;
+  final String title;
+  final String subtitle;
+  final Widget? trailing;
+  final Widget? child;
+  final VoidCallback? onTap;
+
+  const SettingTile({
+    super.key,
+    this.icon,
+    required this.title,
+    required this.subtitle,
+    this.trailing,
+    this.child,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final content = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      spacing: 12,
+      children: [
+        Row(
+          children: [
+            if (icon != null) ...[
+              Icon(icon!, size: 18),
+              const Gap(12),
+            ],
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                spacing: 2,
+                children: [
+                  Text(
+                    title,
+                    style: context.typography.small.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  Text(
+                    subtitle,
+                    style: context.typography.xSmall.copyWith(
+                      color: cs.mutedForeground,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (trailing != null)
+              // A bare switch is read as an unnamed toggle; it switches
+              // exactly what the tile's title says, so it carries that name.
+              trailing is Switch || trailing is Checkbox
+                  ? Semantics(container: true, label: title, child: trailing!)
+                  : trailing!,
+          ],
+        ),
+        if (child != null) child!,
+      ],
+    );
+
+    if (onTap != null) {
+      return SizedBox(
+        width: double.infinity,
+        child: Button.card(
+          style: ButtonStyle.card()
+              .withPadding(padding: const EdgeInsets.all(16))
+              .withBackgroundColor(hoverColor: bkCardHover(context)),
+          onPressed: onTap,
+          child: content,
+        ),
+      );
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: cs.card,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: cs.border),
+      ),
+      child: content,
+    );
+  }
+}

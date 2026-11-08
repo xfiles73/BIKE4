@@ -1,0 +1,13 @@
+name: "Patch (disabilitato)"
+
+# Shorebird patch disabilitato: l'app e' ora gratuita e compilata standard
+# (senza Shorebird). Richiede SHOREBIRD_TOKEN e il submodule privato prop.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  disabled:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "disabled"

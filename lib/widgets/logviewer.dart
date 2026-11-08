@@ -1,0 +1,168 @@
+import 'package:bike_control/gen/l10n.dart';
+import 'package:bike_control/widgets/ui/bk_page_header.dart';
+import 'dart:async';
+import 'dart:io';
+
+import 'package:bike_control/main.dart' show crashLogFile;
+import 'package:bike_control/services/debug_diagnostics.dart';
+import 'package:bike_control/utils/core.dart';
+import 'package:bike_control/utils/i18n_extension.dart';
+import 'package:bike_control/widgets/diagnostics_section.dart';
+import 'package:bike_control/widgets/ui/toast.dart';
+import 'package:bike_control/widgets/ui/type_scale.dart';
+import 'package:dartx/dartx.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart' show SelectionArea;
+import 'package:flutter/services.dart';
+import 'package:shadcn_flutter/shadcn_flutter.dart';
+
+import '../bluetooth/messages/notification.dart';
+
+class LogViewer extends StatefulWidget {
+  const LogViewer({super.key});
+
+  @override
+  State<LogViewer> createState() => _LogviewerState();
+}
+
+class _LogviewerState extends State<LogViewer> {
+  late StreamSubscription<BaseNotification> _actionSubscription;
+  final ScrollController _scrollController = ScrollController();
+  DebugDiagnostics? _diagnostics;
+  bool _scanning = false;
+
+  Future<void> _loadDiagnostics() async {
+    setState(() => _scanning = true);
+    final diag = await DebugDiagnostics.gather(includeDiscovery: true);
+    if (!mounted) return;
+    setState(() {
+      _diagnostics = diag;
+      _scanning = false;
+    });
+  }
+
+  @override
+  void initState() {
+    super.initState();
+
+    _actionSubscription = core.connection.actionStream.listen((data) {
+      if (mounted) {
+        setState(() {});
+        if (_scrollController.hasClients) {
+          // scroll to the bottom
+          _scrollController.animateTo(
+            _scrollController.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 60),
+            curve: Curves.easeInOut,
+          );
+        }
+      }
+    });
+    _loadDiagnostics();
+  }
+
+  @override
+  void dispose() {
+    _actionSubscription.cancel();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      headers: [
+        BkPageHeader(title: context.i18n.logs, showDivider: false),
+      ],
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          spacing: 12,
+          children: [
+            DiagnosticsSection(
+              diagnostics: _diagnostics,
+              scanning: _scanning,
+              onRefresh: _loadDiagnostics,
+            ),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(context.i18n.logViewer).bold,
+                OutlineButton(
+                  child: Text(context.i18n.share),
+                  onPressed: () {
+                    final logText = core.connection.lastLogEntries
+                        .map((entry) => '${entry.date.toString().split(" ").last}  ${entry.entry}')
+                        .join('\n');
+                    final diagnosticsText = _diagnostics?.toText();
+                    final shareText = diagnosticsText == null ? logText : '$diagnosticsText\n\nLogs:\n$logText';
+                    Clipboard.setData(ClipboardData(text: shareText));
+
+                    buildToast(title: context.i18n.logsHaveBeenCopiedToClipboard);
+                  },
+                ),
+              ],
+            ),
+            core.connection.lastLogEntries.isEmpty
+                ? Container()
+                : Expanded(
+                    child: Card(
+                      child: SelectionArea(
+                        child: SingleChildScrollView(
+                          controller: _scrollController,
+                          child: SizedBox(
+                            width: double.infinity,
+                            child: Text.rich(
+                              TextSpan(
+                                children: core.connection.lastLogEntries
+                                    .map(
+                                      (action) => [
+                                        TextSpan(
+                                          text: action.date.toString().split(" ").last,
+                                          style: context.typography.xSmall.copyWith(
+                                            fontFeatures: [FontFeature.tabularFigures()],
+                                            fontFamily: "monospace",
+                                            fontFamilyFallback: <String>["Courier"],
+                                          ),
+                                        ),
+                                        TextSpan(
+                                          text: "  ${action.entry}\n",
+                                          style: context.typography.xSmall.copyWith(
+                                            fontFeatures: [FontFeature.tabularFigures()],
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ],
+                                    )
+                                    .flatten()
+                                    .toList(),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+
+            if (!kIsWeb && (Platform.isMacOS || Platform.isWindows || Platform.isLinux))
+              Padding(
+                padding: const EdgeInsets.only(top: 8.0),
+                child: Row(
+                  children: [
+                    Text('${AppLocalizations.of(context).logsFile} '),
+                    Expanded(
+                      child: FutureBuilder<File>(
+                        future: crashLogFile(),
+                        builder: (context, snapshot) => SelectableText(snapshot.data?.path ?? '').inlineCode,
+                      ),
+                    ),
+                  ],
+                ).small,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}

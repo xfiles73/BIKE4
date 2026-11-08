@@ -1,0 +1,152 @@
+name: "Build Windows"
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.4
+
+jobs:
+  # Build the Windows app and retain it as a workflow artifact.
+  windows:
+    name: Build on Windows
+    runs-on: windows-2025
+
+    steps:
+      #1 Checkout (SENZA `submodules: recursive`: il submodule privato `prop`
+      # non serve, pubspec/lock puntano alla cartella vendorizzata prop_public).
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      #2 Override completi e ALLINEATI (prop -> prop_public, universal_ble -> commit ESATTO
+      # del pubspec.lock). Fissare lo SHA (invece di un branch mobile come main/changes)
+      # impedisce sia il conflitto "prop from path is forbidden" sia regressioni future:
+      # la CI risolve esattamente il commit gia' bloccato nel lock file.
+      - name: Force aligned overrides (prop + universal_ble)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "prop_public/pubspec.yaml")) {
+            Write-Warning "prop_public non trovata: nessun override generato."
+            exit 0
+          }
+          # estrae lo resolved-ref del solo blocco universal_ble
+          $inUB = $false; $ubSha = ""
+          foreach ($line in Get-Content pubspec.lock) {
+            if ($line -match '^  universal_ble:') { $inUB = $true; continue }
+            if ($inUB -and $line -match '^\s+resolved-ref: "?(\w+)"?') { $ubSha = $Matches[1]; $inUB = $false }
+            if ($inUB -and $line -match '^  \w') { $inUB = $false }
+          }
+          if (-not $ubSha) { $ubSha = "d8961d78cb733526915eeb8a0530218a88d5649b" }
+          Write-Output "universal_ble locked at: $ubSha"
+          @"
+          dependency_overrides:
+            prop:
+              path: prop_public
+            universal_ble:
+              git:
+                url: https://github.com/jonasbark/universal_ble.git
+                ref: $ubSha
+          "@ | Set-Content -Path pubspec_overrides.yaml -Encoding utf8
+          Write-Output "--- pubspec_overrides.yaml ---"
+          Get-Content pubspec_overrides.yaml
+
+      #2b Pulizia di eventuali residui del vecchio submodule privato `prop`:
+      # impedisce l'errore "because every version of prop from path depends on
+      # universal_ble ... at changes and bike_control depends on ... at main,
+      # prop from path is forbidden" causato da ref diverse nella stessa riga
+      # di dipendenza git.
+      - name: Remove stale private prop checkout
+        shell: bash
+        run: |
+          rm -rf prop .git/modules/prop || true
+          git config --file .gitmodules --remove-section submodule.prop 2>/dev/null || true
+          ls -d prop 2>/dev/null && echo "ATTENZIONE: cartella prop ancora presente" || echo "OK: nessun checkout 'prop' residuo"
+
+      # Cache delle dipendenze pub: velocizza i run successivi e riduce il traffico di download.
+      - name: Cache Pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Users\runneradmin\AppData\Local\Pub\Cache\hosted
+            .dart_tool
+          key: ${{ runner.os }}-pub-${{ hashFiles('pubspec.lock', 'pubspec_overrides.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
+
+      - name: Set Up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      #3 Long paths su Windows (MAX_PATH) per evitare errori di checkout/cache.
+      - name: Enable git long paths
+        run: git config --system core.longpaths true
+
+      - name: Generate translation files
+        shell: pwsh
+        run: |
+          flutter pub global activate intl_utils
+          flutter pub global run intl_utils:generate
+
+      - name: Test Open Bike network backend
+        run: >-
+          flutter test
+          test/services/network_self_test/settings_backend_test.dart
+          test/services/network_self_test/tcp_probe_integration_test.dart
+          test/widgets/network_troubleshooting_page_test.dart
+
+      - name: Test Windows MyWhoosh Bridge behavior
+        run: >-
+          flutter test
+          test/bluetooth/proxy/proxy_device_saved_retrofit_mode_test.dart
+          test/bluetooth/proxy/proxy_device_advertisement_name_test.dart
+
+      - name: Test DirCon TCP protocol
+        run: flutter test prop_public/test
+
+      #4 Build standard (niente Shorebird). SUPABASE_ANON_KEY e' facoltativo:
+      # senza chiave la sola chat di supporto resta disattivata, tutto il resto funziona.
+      - name: Flutter Release Windows
+        run: >-
+          flutter build windows --release --obfuscate --split-debug-info=symbols-win
+          --dart-define=SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+
+      #5 DLL runtime MSVC per far girare l'exe anche su PC senza
+      # Visual C++ Redistributable installato.
+      - name: Copy MSVC runtime DLLs
+        shell: pwsh
+        run: |
+          $source = "C:\Windows\System32"
+          $destination = "build\windows\x64\runner\Release"
+          foreach ($dll in @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+            $srcPath = Join-Path $source $dll
+            if (Test-Path $srcPath) {
+              Copy-Item -Path $srcPath -Destination (Join-Path $destination $dll) -Force
+              Write-Output "Copied $dll"
+            } else {
+              Write-Warning "$dll not found in $source"
+            }
+          }
+
+      #6 Create a portable zip for the workflow artifact.
+      - name: Create portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+
+          $zipPath = "release\bike_control.windows.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "build/windows/x64/runner/Release/*" -DestinationPath $zipPath
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: Windows Release
+          path: release/bike_control.windows.zip
