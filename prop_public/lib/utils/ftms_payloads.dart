@@ -9,17 +9,18 @@ import 'dart:typed_data';
 
 /// A decoded FTMS INDOOR_BIKE_DATA (0x2AD2) notification.
 class IndoorBikeData {
-  final int? speed100xCmPerSec; // uint16, 0.01 m/s
+  /// Raw Instantaneous Speed field: uint16 in 0.01 km/h.
+  final int? speed100xCmPerSec;
   final double? speedKph;
-  final int? cadenceRevPerMin; // sint16 (revolutions delta per minute)
+  final int? cadenceRevPerMin; // whole revolutions per minute (field is 0.5 rpm)
   final int? powerWatts; // sint16
-  final int? resistanceLevel; // uint16
-  final int? incline100xCm; // sint16, 0.01 m elevation gain
-  final double? gradePercent; // sint16, 0.01 %
+  final int? resistanceLevel; // sint16
+  final int? incline100xCm; // not part of FTMS Indoor Bike Data (always null)
+  final double? gradePercent; // not part of FTMS Indoor Bike Data (always null)
   final int? energyKcalPerHour; // uint16
   final int? energyKcal; // uint16 total
-  final int? rpmCadence; // uint8, revolutions per minute (extended field)
-  final int? heartRateBpm; // uint8 (extended field)
+  final int? rpmCadence; // same as cadenceRevPerMin (kept for API compatibility)
+  final int? heartRateBpm; // uint8
   final DateTime timestamp;
 
   const IndoorBikeData({
@@ -45,111 +46,118 @@ class IndoorBikeData {
 }
 
 /// Bit flags of the 16-bit data-field format in INDOOR_BIKE_DATA.
+///
+/// Fitness Machine Service 1.0, §4.9.1 (org.bluetooth.characteristic.
+/// indoor_bike_data). Note that Instantaneous Speed has no flag of its own:
+/// it is present whenever the `More Data` bit is *clear*.
 class _IbdFlags {
   static const moreData = 0x0001;
   static const avgSpeed = 0x0002;
-  static const instantaneousSpeed = 0x0004;
+  static const instCadence = 0x0004;
   static const avgCadence = 0x0008;
-  static const instantaneousCadence = 0x0010;
-  static const avgPower = 0x0020;
-  static const instantaneousPower = 0x0040;
-  static const resistanceLevel = 0x0080;
-  static const powerOutputPercentage = 0x0100;
+  static const totalDistance = 0x0010;
+  static const resistanceLevel = 0x0020;
+  static const instPower = 0x0040;
+  static const avgPower = 0x0080;
+  static const expendedEnergy = 0x0100;
   static const heartRate = 0x0200;
   static const metabolicEquivalent = 0x0400;
-  static const annotatedStatus = 0x0800;
-  static const extendedAvgCadence = 0x1000;
-  static const extendedInstantaneousCadence = 0x2000;
-  static const elevationGain = 0x4000;
-  static const inclination = 0x8000;
+  static const elapsedTime = 0x0800;
+  static const remainingTime = 0x1000;
 }
 
 /// Decodes an INDOOR_BIKE_DATA characteristic value. Returns null on a
-/// truncated/malformed payload instead of throwing, so a single corrupt
-/// notification never kills the BLE callback chain.
+/// truncated payload instead of throwing, so a single corrupt notification
+/// never kills the BLE callback chain.
+///
+/// Field order (only the fields whose flag is set are transmitted):
+///   Instantaneous Speed (uint16, 0.01 km/h)  — present when !More Data
+///   Average Speed        (uint16, 0.01 km/h)
+///   Instantaneous Cadence(uint16, 0.5 rpm)
+///   Average Cadence      (uint16, 0.5 rpm)
+///   Total Distance       (uint24, m)
+///   Resistance Level     (sint16)
+///   Instantaneous Power  (sint16, W)
+///   Average Power        (sint16, W)
+///   Expended Energy      (uint16 total kcal, uint16 kcal/h, uint8 kcal/min)
+///   Heart Rate           (uint8, bpm)
+///   Metabolic Equivalent (uint8, 0.1 MET)
+///   Elapsed Time         (uint16, s)
+///   Remaining Time       (uint16, s)
 IndoorBikeData? decodeIndoorBikeData(Uint8List bytes) {
-  if (bytes.length < 6) return null;
+  if (bytes.length < 2) return null;
   final bd = ByteData.sublistView(bytes);
   final flags = bd.getUint16(0, Endian.little);
 
-  double? speedKph;
-  int? instSpeed;
-  int? cadence;
-  int? extCadence;
-  int? power;
-  int? resistance;
-  int? elevation;
-  int? grade;
-  int? kcalH;
-  int? kcal;
-  int? hr;
-
-  var o = 4; // after flags + elapsed time uint16
-  bool take(int len) => o + len <= bytes.length;
-
-  if ((flags & _IbdFlags.moreData) != 0 && take(2)) {
-    // FIT ID: sport type + time source — skip both.
-    o += 2;
-  }
-  if ((flags & _IbdFlags.avgSpeed) != 0 && take(2)) o += 2; // average speed unused here
-  if ((flags & _IbdFlags.instantaneousSpeed) != 0 && take(2)) {
-    instSpeed = bd.getUint16(o, Endian.little);
-    speedKph = instSpeed! * 0.036; // 0.01 m/s -> km/h
-    o += 2;
-  }
-  if ((flags & _IbdFlags.avgCadence) != 0 && take(2)) o += 2;
-  if ((flags & _IbdFlags.instantaneousCadence) != 0 && take(2)) {
-    cadence = bd.getInt16(o, Endian.little);
-    o += 2;
-  }
-  if ((flags & _IbdFlags.avgPower) != 0 && take(2)) o += 2;
-  if ((flags & _IbdFlags.instantaneousPower) != 0 && take(2)) {
-    power = bd.getInt16(o, Endian.little);
-    o += 2;
-  }
-  if ((flags & _IbdFlags.resistanceLevel) != 0 && take(2)) {
-    resistance = bd.getUint16(o, Endian.little);
-    o += 2;
-  }
-  if ((flags & _IbdFlags.powerOutputPercentage) != 0 && take(1)) o += 1;
-  if ((flags & _IbdFlags.heartRate) != 0 && take(1)) {
-    hr = bd.getUint8(o);
+  var o = 2;
+  // Each helper returns null when the payload ends early and leaves the
+  // offset untouched, so later fields simply come out null instead of being
+  // read from a misaligned position.
+  int? u8() {
+    if (o + 1 > bytes.length) return null;
+    final v = bd.getUint8(o);
     o += 1;
+    return v;
   }
-  if ((flags & _IbdFlags.metabolicEquivalent) != 0 && take(1)) o += 1;
-  if ((flags & _IbdFlags.annotatedStatus) != 0 && take(1)) o += 1;
-  if ((flags & _IbdFlags.extendedAvgCadence) != 0 && take(2)) o += 2;
-  if ((flags & _IbdFlags.extendedInstantaneousCadence) != 0 && take(2)) {
-    extCadence = bd.getUint16(o, Endian.little);
+
+  int? u16() {
+    if (o + 2 > bytes.length) return null;
+    final v = bd.getUint16(o, Endian.little);
     o += 2;
+    return v;
   }
-  if ((flags & _IbdFlags.elevationGain) != 0 && take(2)) {
-    elevation = bd.getUint16(o, Endian.little);
+
+  int? s16() {
+    if (o + 2 > bytes.length) return null;
+    final v = bd.getInt16(o, Endian.little);
     o += 2;
+    return v;
   }
-  if ((flags & _IbdFlags.inclination) != 0 && take(2)) {
-    grade = bd.getInt16(o, Endian.little);
-    o += 2;
+
+  int? u24() {
+    if (o + 3 > bytes.length) return null;
+    final v = bd.getUint8(o) | (bd.getUint8(o + 1) << 8) | (bd.getUint8(o + 2) << 16);
+    o += 3;
+    return v;
   }
-  // Remaining optional fields (energy counters) are position-dependent on the
-  // flags above; read them only when enough bytes remain to be unambiguous.
-  if (take(4)) {
-    kcalH = bd.getUint16(o, Endian.little);
-    kcal = bd.getUint16(o + 2, Endian.little);
-    o += 4;
+
+  int? speedRaw;
+  if ((flags & _IbdFlags.moreData) == 0) speedRaw = u16();
+  if ((flags & _IbdFlags.avgSpeed) != 0) u16();
+  final cadenceRaw = (flags & _IbdFlags.instCadence) != 0 ? u16() : null;
+  if ((flags & _IbdFlags.avgCadence) != 0) u16();
+  if ((flags & _IbdFlags.totalDistance) != 0) u24();
+  final resistance = (flags & _IbdFlags.resistanceLevel) != 0 ? s16() : null;
+  final power = (flags & _IbdFlags.instPower) != 0 ? s16() : null;
+  if ((flags & _IbdFlags.avgPower) != 0) s16();
+  int? kcal;
+  int? kcalH;
+  if ((flags & _IbdFlags.expendedEnergy) != 0) {
+    kcal = u16();
+    kcalH = u16();
+    u8();
   }
+  final hr = (flags & _IbdFlags.heartRate) != 0 ? u8() : null;
+  if ((flags & _IbdFlags.metabolicEquivalent) != 0) u8();
+  if ((flags & _IbdFlags.elapsedTime) != 0) u16();
+  if ((flags & _IbdFlags.remainingTime) != 0) u16();
+
+  // Instantaneous Speed: uint16, resolution 0.01 km/h.
+  final speedKph = speedRaw == null ? null : speedRaw / 100.0;
+  // Instantaneous Cadence: uint16, resolution 0.5 rpm.
+  final cadence = cadenceRaw == null ? null : (cadenceRaw * 0.5).round();
 
   return IndoorBikeData(
-    speed100xCmPerSec: instSpeed,
+    speed100xCmPerSec: speedRaw,
     speedKph: speedKph,
     cadenceRevPerMin: cadence,
     powerWatts: power,
     resistanceLevel: resistance,
-    incline100xCm: elevation,
-    gradePercent: grade == null ? null : grade / 100.0,
+    incline100xCm: null,
+    gradePercent: null,
     energyKcalPerHour: kcalH,
     energyKcal: kcal,
-    rpmCadence: extCadence ?? cadence,
+    rpmCadence: cadence,
     heartRateBpm: hr,
     timestamp: DateTime.now(),
   );
@@ -288,42 +296,29 @@ class CyclingPowerData {
 }
 
 CyclingPowerData? decodeCyclingPowerMeasurement(Uint8List bytes) {
-  if (bytes.length < 2) return null;
+  // Flags (uint16) + Instantaneous Power (sint16) are mandatory.
+  if (bytes.length < 4) return null;
   final bd = ByteData.sublistView(bytes);
   final flags = bd.getUint16(0, Endian.little);
   var o = 2;
-  int? power;
+
+  // Cycling Power Measurement §4.3: the optional fields follow in bit order
+  // after the mandatory power value.
+  final power = bd.getInt16(o, Endian.little);
+  o += 2;
+
+  if ((flags & 0x0001) != 0) o += 1; // Pedal Power Balance (uint8, 0.5 %)
+  if ((flags & 0x0004) != 0) o += 2; // Accumulated Torque (uint16, 1/32 Nm)
+  if ((flags & 0x0010) != 0) o += 6; // Wheel Revolution Data (uint32 + uint16)
+
   int? revs;
   int? evt;
-  if ((flags & 0x0004) != 0 && o + 2 <= bytes.length) {
-    // Pedal Power Balance present (uint8)
-    o += 1;
-  }
-  if ((flags & 0x0008) != 0 && o + 4 <= bytes.length) {
-    // Power Phase (2x uint8)
-    o += 2;
-  }
-  if ((flags & 0x0010) != 0 && o + 2 <= bytes.length) {
-    // Extended Angle Profile (2x uint8)
-    o += 2;
-  }
-  if ((flags & 0x0020) != 0 && o + 2 <= bytes.length) {
-    // Force Magnitude (2x sint16)
-    o += 4;
-  }
-  if ((flags & 0x0040) != 0 && o + 2 <= bytes.length) {
-    // Torque (sint16)
-    o += 2;
-  }
-  if ((flags & 0x0001) != 0 && o + 4 <= bytes.length) {
+  if ((flags & 0x0020) != 0 && o + 4 <= bytes.length) {
     revs = bd.getUint16(o, Endian.little);
     evt = bd.getUint16(o + 2, Endian.little);
     o += 4;
   }
-  if ((flags & 0x0002) != 0 && o + 2 <= bytes.length) {
-    power = bd.getInt16(o, Endian.little);
-    o += 2;
-  }
+  // Extreme force/torque/angle fields that may follow are not needed here.
   return CyclingPowerData(powerWatts: power, crankRevolutions: revs, lastCrankEventTime1024ths: evt);
 }
 

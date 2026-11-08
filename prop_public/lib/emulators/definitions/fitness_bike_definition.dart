@@ -586,25 +586,29 @@ class FitnessBikeDefinition extends BleDefinition {
   /// INDOOR_BIKE_DATA / CP measurements.
   void subscribeToTrainer() {
     _startUpstreamRouting();
-    unawaited(_subscribeNow());
+    unawaited(ensureTrainerSubscriptions());
   }
 
-  Future<void> _subscribeNow() async {
+  /// Enables CCCD notifications on the physical trainer without installing a
+  /// second notification listener: the bridge device already relays trainer
+  /// values into [onNotification], so this only turns the tap on.
+  Future<void> ensureTrainerSubscriptions() async {
+    if (_disposed) return;
     final t = transport;
     if (t is BleTrainerTransport) {
       await t.subscribeToAllDiscovered(connectedDeviceServices);
-    } else {
-      for (final s in connectedDeviceServices) {
-        for (final c in s.characteristics) {
-          final props = c.properties;
-          final canNotify = props.contains(CharacteristicProperty.notify);
-          final canIndicate = props.contains(CharacteristicProperty.indicate);
-          if (!canNotify && !canIndicate) continue;
-          try {
-            await t.subscribe(s.uuid, c.uuid, indicate: canIndicate && !canNotify);
-          } catch (e) {
-            debugPrint('FitnessBikeDefinition: subscribe ${c.uuid} failed: $e');
-          }
+      return;
+    }
+    for (final s in connectedDeviceServices) {
+      for (final c in s.characteristics) {
+        final props = c.properties;
+        final canNotify = props.contains(CharacteristicProperty.notify);
+        final canIndicate = props.contains(CharacteristicProperty.indicate);
+        if (!canNotify && !canIndicate) continue;
+        try {
+          await t.subscribe(s.uuid, c.uuid, indicate: canIndicate && !canNotify);
+        } catch (e) {
+          debugPrint('FitnessBikeDefinition: subscribe ${c.uuid} failed: $e');
         }
       }
     }
@@ -724,16 +728,20 @@ class FitnessBikeDefinition extends BleDefinition {
           ..setInt16(2, _powerMax, Endian.little)
           ..setInt16(4, 1, Endian.little);
         return Future.value(b.buffer.asUint8List());
-      case '2a64': // Cycling Power Feature: crank-rev + power measurement bits
-        return Future.value(Uint8List.fromList([0x05, 0, 0, 0]));
+      case '2a64': // Cycling Power Feature: crank revolution data supported.
+        return Future.value(Uint8List.fromList([0x08, 0, 0, 0]));
       default:
         return null;
     }
   }
 
   Uint8List _buildClientFeature() {
+    // Fitness Machine Features: Average Speed (0), Cadence (1), Inclination
+    // (3), Resistance Level (7), Heart Rate (10), Power Measurement (14).
+    // Resistance Level is advertised because the Indoor Bike Data frames we
+    // push to the game include that field.
     const machineFeatures =
-        (1 << 0) | (1 << 1) | (1 << 3) | (1 << 10) | (1 << 14);
+        (1 << 0) | (1 << 1) | (1 << 3) | (1 << 7) | (1 << 10) | (1 << 14);
     const targetSettings = (1 << 2) | (1 << 3) | (1 << 13);
     final b = ByteData(8)
       ..setUint32(0, machineFeatures, Endian.little)
@@ -1041,51 +1049,83 @@ class FitnessBikeDefinition extends BleDefinition {
   }
 
   void _startTelemetryLoop() {
-    _telemetryTimer ??= Timer.periodic(const Duration(seconds: 1), (_) => _pushClientTelemetry());
+    if (_telemetryTimer != null) return;
+    // Push one frame right away (deferred one turn so it can't overtake the
+    // ENABLE reply on the wire): games often show "no signal" until the first
+    // notification arrives, and waiting a full second delays the pairing UI.
+    Timer.run(_pushClientTelemetry);
+    _telemetryTimer = Timer.periodic(const Duration(seconds: 1), (_) => _pushClientTelemetry());
   }
 
   void _pushClientTelemetry() {
-    final speedKph = _speedKphN.value ?? 0;
-    final speedCm = (speedKph / 3.6 * 100).round(); // 0.01 m/s
-    final cadence = _cadenceRpmN.value ?? 0;
-    final power = _powerWN.value ?? 0;
-    final hr = _heartRateBpmN.value ?? 0;
-    final grade = (_smoothedGradePercent * 100).round().clamp(-32768, 32767);
+    if (_disposed) return;
+    final now = DateTime.now();
+    final rawDt = _lastTelemetryAt == null ? 1.0 : now.difference(_lastTelemetryAt!).inMicroseconds / 1e6;
+    final dt = rawDt.clamp(0.0, 5.0).toDouble();
+    _lastTelemetryAt = now;
 
-    // INDOOR_BIKE_DATA: flags(inst speed|cad|pow|hr|incl) + elapsed u16 + fields.
-    const flags = 0x0004 | 0x0010 | 0x0040 | 0x0200 | 0x8000;
-    final ibd = ByteData(15)
-      ..setUint16(0, flags, Endian.little)
-      ..setUint16(2, _elapsedTenths++ % 0xFFFF, Endian.little)
-      ..setUint16(4, speedCm.clamp(0, 0xFFFF), Endian.little)
-      ..setInt16(6, cadence.clamp(-32768, 32767), Endian.little)
-      ..setInt16(8, power.clamp(-32768, 32767), Endian.little)
-      ..setUint8(10, hr.clamp(0, 255))
-      ..setUint16(11, 0, Endian.little) // elevation gain
-      ..setInt16(13, grade, Endian.little);
+    final speedKph = (_speedKphN.value ?? 0).clamp(0.0, 120.0);
+    final cadenceRpm = (_cadenceRpmN.value ?? 0).clamp(0, 250);
+    final powerW = (_powerWN.value ?? 0).clamp(0, 3000);
+    final bpm = (_heartRateBpmN.value ?? 0).clamp(0, 255);
+
+    // FTMS INDOOR_BIKE_DATA (0x2AD2), Fitness Machine Service 1.0 §4.9.1.
+    // Field order is fixed by the flag bitmap below; every game decodes it in
+    // this order, so any deviation shifts all following values.
+    //   0x0004 Instantaneous Cadence (uint16, 0.5 rpm)
+    //   0x0020 Resistance Level      (sint16)
+    //   0x0040 Instantaneous Power   (sint16, W)
+    //   0x0200 Heart Rate            (uint8, bpm)
+    // Instantaneous Speed (uint16, 0.01 km/h) is always present because the
+    // "More Data" bit (0x0001) is clear.
+    const ibdFlags = 0x0004 | 0x0020 | 0x0040 | 0x0200;
+    final ibd = ByteData(11)
+      ..setUint16(0, ibdFlags, Endian.little)
+      ..setUint16(2, (speedKph * 100).round().clamp(0, 0xFFFF), Endian.little)
+      ..setUint16(4, (cadenceRpm * 2).clamp(0, 0xFFFF), Endian.little)
+      ..setInt16(6, 0, Endian.little) // resistance level
+      ..setInt16(8, powerW, Endian.little)
+      ..setUint8(10, bpm);
     sendCharacteristicNotification(INDOOR_BIKE_DATA_UUID, ibd.buffer.asUint8List());
 
-    // CYCLING_POWER_MEASUREMENT: flags(crank|power) + revs + evt + power.
-    _clientCrankRevs = (_clientCrankRevs + (cadence ~/ 60)) & 0xFFFF;
-    _clientCrankEvt = (_clientCrankEvt + ((cadence * 1024) ~/ 60)) & 0xFFFF;
+    // CYCLING_POWER_MEASUREMENT (0x2A63): flags + mandatory Instantaneous
+    // Power, then Crank Revolution Data (0x0020): cumulative revolutions
+    // (uint16) and last crank event time (uint16, 1/1024 s).
+    final crankDelta = cadenceRpm / 60.0 * dt;
+    _clientCrankRevsFrac += crankDelta;
+    final wholeRevs = _clientCrankRevsFrac.floor();
+    if (wholeRevs > 0) {
+      _clientCrankRevs = (_clientCrankRevs + wholeRevs) & 0xFFFF;
+      _clientCrankRevsFrac -= wholeRevs;
+    }
+    _clientCrankEvt = (_clientCrankEvt + (dt * 1024).round()) & 0xFFFF;
+
     final cp = ByteData(8)
-      ..setUint16(0, 0x0001 | 0x0002, Endian.little)
-      ..setUint16(2, _clientCrankRevs, Endian.little)
-      ..setUint16(4, _clientCrankEvt, Endian.little)
-      ..setInt16(6, power.clamp(-32768, 32767), Endian.little);
+      ..setUint16(0, 0x0020, Endian.little)
+      ..setInt16(2, powerW, Endian.little)
+      ..setUint16(4, _clientCrankRevs, Endian.little)
+      ..setUint16(6, _clientCrankEvt, Endian.little);
     sendCharacteristicNotification(CYCLING_POWER_MEASUREMENT_UUID, cp.buffer.asUint8List());
   }
 
-  int _elapsedTenths = 0;
+  DateTime? _lastTelemetryAt;
+  double _clientCrankRevsFrac = 0;
   int _clientCrankRevs = 0;
   int _clientCrankEvt = 0;
 
+  /// Test seam: emit one telemetry frame without waiting for the 1 Hz timer.
+  @visibleForTesting
+  void pushTelemetryForTesting() => _pushClientTelemetry();
+
   @override
   void onNotification(String characteristic, Uint8List bytes) {
-    // Notifications FROM the game side (our peripheral transport relays them
-    // here when the platform delivers them as values rather than writes).
-    // The DirCon transporter routes control-point traffic through
-    // onWriteRequest; anything else is ignored safely.
+    // Upstream trainer notifications reach the definition here: ProxyDevice
+    // listens to the trainer transport and hands every value to the emulator's
+    // processCharacteristic(), which routes it to the child owning the
+    // characteristic. Decode them into the rider metrics; the telemetry we
+    // push to the game is built from those.
+    if (bytes.isEmpty) return;
+    _handleUpstreamNotification((characteristic: characteristic, value: bytes));
   }
 
   void _log(String message) {
