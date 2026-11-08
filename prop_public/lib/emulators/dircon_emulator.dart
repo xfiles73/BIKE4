@@ -22,6 +22,7 @@ import 'package:prop/emulators/definitions/zwift_emulator_definition.dart';
 import 'package:prop/emulators/transporter/network_transporter.dart';
 import 'package:prop/mdns/service_advertiser.dart';
 import 'package:prop/utils/resilient_tcp_server.dart';
+import 'package:prop/utils/self_advertisement_registry.dart';
 import 'package:prop/utils/shared.dart';
 
 enum RetrofitMode {
@@ -84,6 +85,11 @@ class DirconEmulator {
   ResilientTcpServer? _server;
   ServiceAdvertisement? _mdnsRegistration;
   NetworkTransporter? _transporter;
+
+  /// Name/port currently registered in [SelfAdvertisementRegistry] so the
+  /// WiFi scanner excludes our own advertisement, and so teardown can remove
+  /// exactly the entry we added (the advertisement name can change).
+  ({String name, int port})? _registeredEntry;
 
   /// The port the TCP listener actually bound (fallback-aware), or null when
   /// the server is not running.
@@ -224,6 +230,8 @@ class DirconEmulator {
           txt: full,
         ),
       );
+      _registeredEntry = (name: advertisementName, port: port);
+      SelfAdvertisementRegistry.instance.add(name: advertisementName, port: port);
       if (kDebugMode) {
         print('DirconEmulator advertising at ${address.address}:$port as "$advertisementName"');
       }
@@ -251,10 +259,15 @@ class DirconEmulator {
   }
 
   Future<void> _cleanup() async {
+    final entry = _registeredEntry;
+    _registeredEntry = null;
     await _mdnsRegistration?.unregister().catchError((Object e) {
       debugPrint('DirconEmulator: mDNS unregister failed: $e');
     });
     _mdnsRegistration = null;
+    if (entry != null) {
+      SelfAdvertisementRegistry.instance.remove(name: entry.name, port: entry.port);
+    }
     _transporter?.dispose();
     _transporter = null;
     await _server?.stop();
@@ -281,9 +294,14 @@ class DirconEmulator {
 
   Future<void> pauseAdvertising() async {
     final reg = _mdnsRegistration;
+    final entry = _registeredEntry;
+    _registeredEntry = null;
     if (reg != null) {
       await reg.unregister().catchError((Object e) => debugPrint('pauseAdvertising: $e'));
       _mdnsRegistration = null;
+    }
+    if (entry != null) {
+      SelfAdvertisementRegistry.instance.remove(name: entry.name, port: entry.port);
     }
   }
 

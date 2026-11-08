@@ -23,7 +23,10 @@
 //                                    registers a subscription
 //   0x07 ECHO                     -> echoed back unchanged
 //
-// Replies carry the response code in header byte 3; notifications ride on 0x06.
+// Replies carry the response code in header byte 3; READ, WRITE and ENABLE
+// replies must echo the 16 raw bytes of the characteristic UUID (DirCon /
+// WFTNP requirement — clients match the reply to their request by it).
+// Notifications ride on 0x06 (UUID + value).
 
 import 'dart:io';
 import 'dart:typed_data';
@@ -217,17 +220,24 @@ class NetworkTransporter extends Transporter {
           return;
         }
         final uuid = uuidFrom(p);
+        final uuidRaw = uuidBytes(uuid);
         final result = definition.onReadRequest(uuid);
         if (result == null) {
-          _writeFrame(type, const [], sequenceNumber: sequenceNumber,
+          _writeFrame(type, uuidRaw, sequenceNumber: sequenceNumber,
               responseCode: FtmsMdnsConstants.DC_RC_CHARACTERISTIC_OPERATION_NOT_SUPPORTED);
           return;
         }
         result.then((bytes) {
-          _writeFrame(type, bytes, sequenceNumber: sequenceNumber);
+          // DirCon READ responses echo the characteristic UUID before the
+          // value; clients (e.g. MyWhoosh) match replies by UUID and hang or
+          // retry the connection when it is missing.
+          final payload = Uint8List(16 + bytes.length)
+            ..setRange(0, 16, uuidRaw)
+            ..setRange(16, 16 + bytes.length, bytes);
+          _writeFrame(type, payload, sequenceNumber: sequenceNumber);
         }).catchError((Object e) {
           debugPrint('NetworkTransporter read failed ($uuid): $e');
-          _writeFrame(type, const [], sequenceNumber: sequenceNumber,
+          _writeFrame(type, uuidRaw, sequenceNumber: sequenceNumber,
               responseCode: FtmsMdnsConstants.DC_RC_UNEXPECTED_ERROR);
         });
 
@@ -240,7 +250,7 @@ class NetworkTransporter extends Transporter {
         final uuid = uuidFrom(p);
         final value = p.sublist(16);
         definition.onWriteRequest(uuid, value);
-        _writeFrame(type, const [], sequenceNumber: sequenceNumber);
+        _writeFrame(type, uuidBytes(uuid), sequenceNumber: sequenceNumber);
 
       case FtmsMdnsConstants.DC_MESSAGE_ENABLE_CHARACTERISTIC_NOTIFICATIONS:
         if (p.length < 16) {
@@ -256,7 +266,7 @@ class NetworkTransporter extends Transporter {
         } else {
           _subscribed.remove(uuid);
         }
-        _writeFrame(type, const [], sequenceNumber: sequenceNumber);
+        _writeFrame(type, uuidBytes(uuid), sequenceNumber: sequenceNumber);
 
       case FtmsMdnsConstants.DC_MESSAGE_ECHO:
         _writeFrame(type, p, sequenceNumber: sequenceNumber);
@@ -281,8 +291,10 @@ class NetworkTransporter extends Transporter {
     bool has(CharacteristicProperty p) => ch.properties.contains(p);
     if (has(CharacteristicProperty.read)) flags |= 0x01;
     if (has(CharacteristicProperty.write) || has(CharacteristicProperty.writeWithoutResponse)) flags |= 0x02;
-    if (has(CharacteristicProperty.notify)) flags |= 0x04;
-    if (has(CharacteristicProperty.indicate)) flags |= 0x08;
+    // DirCon has no INDICATE property: reliable delivery is inherent to TCP,
+    // so characteristics that indicate (e.g. the FTMS Control Point) must
+    // advertise NOTIFY or clients never subscribe to their responses.
+    if (has(CharacteristicProperty.notify) || has(CharacteristicProperty.indicate)) flags |= 0x04;
     return flags;
   }
 

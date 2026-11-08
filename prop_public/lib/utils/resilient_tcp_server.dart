@@ -166,13 +166,17 @@ class ResilientTcpServer {
     } catch (_) {}
 
     _clients.add(socket);
-    socket.done.then((_) => _detach(socket, notifyDisconnect: !_clients.contains(socket)));
+    // A clean close from the client (FIN, or the app dropping the socket)
+    // ends the read stream without an error; treat it exactly like a
+    // disconnect so isConnected/_transporter don't go stale and the next
+    // reconnect starts from a clean slate.
     socket.listen(
       (data) => onData(socket, data),
       onError: (Object e) {
         debugPrint('${label ?? 'TcpServer'} client error: $e');
         _detach(socket, notifyDisconnect: true);
       },
+      onDone: () => _detach(socket, notifyDisconnect: true),
       cancelOnError: false,
     );
 

@@ -276,21 +276,27 @@ abstract final class MdnsBuilder {
 
   static List<int> _txtRdata(Map<String, Uint8List> txt) {
     final b = BytesBuilder();
-    // Split into <=255-byte chunks per TXT record rules.
-    final joined = BytesBuilder();
+    // RFC 6762/6763: the TXT rdata is a sequence of length-prefixed strings,
+    // one per `<key>=<value>` pair — NOT one NUL-joined blob. Only a single
+    // string longer than 255 bytes may be split across several chunks.
+    var wrote = false;
     txt.forEach((k, v) {
-      joined.add(utf8.encode('$k='));
-      joined.add(v);
-      joined.addByte(0);
+      final segment = <int>[...utf8.encode('$k='), ...v];
+      if (segment.isEmpty) {
+        b.addByte(0);
+      } else {
+        var off = 0;
+        while (off < segment.length) {
+          final chunk = min(255, segment.length - off);
+          b.addByte(chunk);
+          b.add(segment.sublist(off, off + chunk));
+          off += chunk;
+        }
+      }
+      wrote = true;
     });
-    final all = joined.toBytes();
-    var off = 0;
-    while (off < all.length) {
-      final chunk = min(255, all.length - off);
-      b.addByte(chunk);
-      b.add(all.sublist(off, off + chunk));
-      off += chunk;
-    }
+    // A TXT record must contain at least one string (possibly empty).
+    if (!wrote) b.addByte(0);
     return b.toBytes();
   }
 
@@ -323,7 +329,12 @@ abstract final class MdnsBuilder {
     final serviceFq = '${svc.type}.local';
     final instanceFq = '${svc.name}.$serviceFq';
     final hostFq = '$hostLabel.local';
-    final wants = {for (final q in questions) q.toLowerCase()};
+    // `parseQuestions` prefixes each name with its record type ("PTR …",
+    // "SRV …"), so match on the name part only.
+    final wants = {
+      for (final q in questions)
+        (q.contains(' ') ? q.substring(q.indexOf(' ') + 1) : q).toLowerCase(),
+    };
     final rel = <String>{serviceFq.toLowerCase(), instanceFq.toLowerCase(), hostFq.toLowerCase()};
     if (!wants.any(rel.contains)) return null;
     return buildAnnouncement(svc, hostLabel);
