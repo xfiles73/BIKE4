@@ -44,7 +44,7 @@ void main() {
     );
   });
 
-  test('characteristic discovery prefixes service UUID and uses DirCon property bits', () async {
+  test('characteristic discovery prefixes service UUID and maps INDICATE to DirCon NOTIFY', () async {
     final service = NetworkTransporter.uuidBytes(_TestDefinition.serviceUuid);
     final characteristic = NetworkTransporter.uuidBytes(_TestDefinition.characteristicUuid);
     final response = await harness.exchange([
@@ -68,7 +68,91 @@ void main() {
         33,
         ...service,
         ...characteristic,
-        0x0a,
+        // DirCon properties are only READ 0x01, WRITE 0x02 and NOTIFY 0x04:
+        // there is no INDICATE property/message type. A write+indicate
+        // characteristic (the FTMS Control Point) must therefore advertise
+        // WRITE|NOTIFY = 0x06, or clients never subscribe to its responses.
+        0x06,
+      ],
+    );
+  });
+  test('read echoes the characteristic UUID before the value', () async {
+    final characteristic = NetworkTransporter.uuidBytes(_TestDefinition.characteristicUuid);
+    final response = await harness.exchange([
+      1,
+      FtmsMdnsConstants.DC_MESSAGE_READ_CHARACTERISTIC,
+      0x2c,
+      0,
+      0,
+      16,
+      ...characteristic,
+    ]);
+
+    expect(
+      response,
+      [
+        1,
+        FtmsMdnsConstants.DC_MESSAGE_READ_CHARACTERISTIC,
+        0x2c,
+        FtmsMdnsConstants.DC_RC_REQUEST_COMPLETED_SUCCESSFULLY,
+        0,
+        18, // UUID (16) + value (2)
+        ...characteristic,
+        ..._TestDefinition.readValue,
+      ],
+    );
+  });
+
+  test('write echoes the characteristic UUID', () async {
+    final characteristic = NetworkTransporter.uuidBytes(_TestDefinition.characteristicUuid);
+    final response = await harness.exchange([
+      1,
+      FtmsMdnsConstants.DC_MESSAGE_WRITE_CHARACTERISTIC,
+      0x2d,
+      0,
+      0,
+      17,
+      ...characteristic,
+      0x01,
+    ]);
+
+    expect(
+      response,
+      [
+        1,
+        FtmsMdnsConstants.DC_MESSAGE_WRITE_CHARACTERISTIC,
+        0x2d,
+        FtmsMdnsConstants.DC_RC_REQUEST_COMPLETED_SUCCESSFULLY,
+        0,
+        16,
+        ...characteristic,
+      ],
+    );
+  });
+
+  test('enable notifications echoes the characteristic UUID', () async {
+    final characteristic = NetworkTransporter.uuidBytes(_TestDefinition.characteristicUuid);
+    final response = await harness.exchange([
+      1,
+      FtmsMdnsConstants.DC_MESSAGE_ENABLE_CHARACTERISTIC_NOTIFICATIONS,
+      0x2e,
+      0,
+      0,
+      17,
+      ...characteristic,
+      0x01,
+    ]);
+
+    expect(
+      response,
+      [
+        1,
+        FtmsMdnsConstants.DC_MESSAGE_ENABLE_CHARACTERISTIC_NOTIFICATIONS,
+        0x2e,
+        FtmsMdnsConstants.DC_RC_REQUEST_COMPLETED_SUCCESSFULLY,
+        0,
+        16,
+        ...characteristic,
       ],
     );
   });
@@ -77,6 +161,7 @@ void main() {
 class _TestDefinition extends BleDefinition {
   static const serviceUuid = '00001826-0000-1000-8000-00805f9b34fb';
   static const characteristicUuid = '00002ad9-0000-1000-8000-00805f9b34fb';
+  static const readValue = [0xaa, 0xbb];
 
   @override
   List<String> get serviceUUIDs => const [serviceUuid];
@@ -94,6 +179,10 @@ class _TestDefinition extends BleDefinition {
 
   @override
   void onWriteRequest(String characteristicUUID, List<int> characteristicData) {}
+
+  @override
+  Future<Uint8List>? onReadRequest(String characteristicUUID) =>
+      Future.value(Uint8List.fromList(readValue));
 
   @override
   void onNotification(String characteristic, Uint8List bytes) {}
